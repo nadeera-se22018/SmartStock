@@ -17,5 +17,7 @@ public interface ProductRepository
 
     boolean existsByBarcodeAndIdNot(String barcode, Long id);
 
+    boolean existsByCategoryIdAndActiveTrue(Long categoryId);
+
     Optional<Product> findByBarcode(String barcode);
 }
