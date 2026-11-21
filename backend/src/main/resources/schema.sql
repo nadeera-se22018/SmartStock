@@ -93,19 +93,37 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS suppliers (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     name VARCHAR(180) NOT NULL,
-    contact_person VARCHAR(150),
-    email VARCHAR(180),
-    phone VARCHAR(50),
-    address_line_1 VARCHAR(255),
-    address_line_2 VARCHAR(255),
-    city VARCHAR(100),
-    postal_code VARCHAR(30),
+    normalized_name VARCHAR(180) NOT NULL,
+    contact_person VARCHAR(180),
+    email VARCHAR(255),
+    phone VARCHAR(30),
+    address TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    version BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT uk_suppliers_normalized_name UNIQUE (normalized_name),
     INDEX idx_suppliers_name (name),
-    INDEX idx_suppliers_email (email)
+    INDEX idx_suppliers_normalized_name (normalized_name),
+    INDEX idx_suppliers_email (email),
+    INDEX idx_suppliers_phone (phone),
+    INDEX idx_suppliers_active (is_active)
 ) ENGINE=InnoDB;
+
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS normalized_name VARCHAR(180);
+ALTER TABLE suppliers MODIFY COLUMN contact_person VARCHAR(180);
+ALTER TABLE suppliers MODIFY COLUMN email VARCHAR(255);
+ALTER TABLE suppliers MODIFY COLUMN phone VARCHAR(30);
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS address TEXT;
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+UPDATE suppliers
+SET normalized_name = LOWER(TRIM(REGEXP_REPLACE(name, '[[:space:]]+', ' ')))
+WHERE normalized_name IS NULL OR normalized_name = '';
+ALTER TABLE suppliers MODIFY COLUMN normalized_name VARCHAR(180) NOT NULL;
+ALTER TABLE suppliers ADD UNIQUE INDEX IF NOT EXISTS uk_suppliers_normalized_name (normalized_name);
+ALTER TABLE suppliers ADD INDEX IF NOT EXISTS idx_suppliers_normalized_name (normalized_name);
+ALTER TABLE suppliers ADD INDEX IF NOT EXISTS idx_suppliers_phone (phone);
+ALTER TABLE suppliers ADD INDEX IF NOT EXISTS idx_suppliers_active (is_active);
 
 CREATE TABLE IF NOT EXISTS customers (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
