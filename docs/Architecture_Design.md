@@ -738,3 +738,545 @@ The developer should not begin implementation until these decisions are confirme
 - [ ] Required tests are listed in the pull request checklist.
 
 **Architectural recommendation:** implement EPIC-02 as an independently testable product/category module, but establish the shared exception, DTO, mapper, pagination, migration, and authorization conventions now. Every later epic—purchasing, inventory, sales, reporting, and audit—should reuse these conventions rather than create parallel implementations.
+
+---
+
+# 16. Phase 1 Architecture — EPIC-03 Supplier Management
+
+## 16.1 Scope
+
+EPIC-03 delivers:
+
+1. A `Supplier` entity and versioned database schema.
+2. Supplier create, update, read, search/list, and soft-deactivation operations.
+3. Duplicate supplier detection where practical.
+4. Supplier purchase-history retrieval when EPIC-04 purchase records exist.
+5. Server-side authorization and consistent RFC 7807 error responses.
+
+EPIC-03 must not implement purchase orders, goods receipts, inventory mutations, or reporting calculations. Supplier purchase history is a read-only projection owned by the purchasing domain and exposed through the supplier API.
+
+## 16.2 Required Folder Structure
+
+```text
+backend/src/main/java/com/smartstock/backend/supplier/
+├── controller/
+│   └── SupplierController.java
+├── dto/
+│   ├── SupplierCreateRequest.java
+│   ├── SupplierUpdateRequest.java
+│   ├── SupplierResponse.java
+│   ├── SupplierSearchCriteria.java
+│   ├── SupplierPurchaseHistoryResponse.java
+│   └── SupplierPurchaseSummaryResponse.java
+├── entity/
+│   └── Supplier.java
+├── mapper/
+│   └── SupplierMapper.java
+├── repository/
+│   └── SupplierRepository.java
+└── service/
+    ├── SupplierService.java
+    └── SupplierServiceImpl.java
+```
+
+The purchase-history read boundary belongs to a purchasing-domain port when implemented:
+
+```text
+supplier/port/SupplierPurchaseHistoryReader.java
+```
+
+EPIC-03 must not make supplier services depend on purchase entity implementation classes.
+
+## 16.3 Entity Structure
+
+### Supplier
+
+```java
+@Entity
+@Table(
+    name = "suppliers",
+    indexes = {
+        @Index(name = "idx_suppliers_name", columnList = "name"),
+        @Index(name = "idx_suppliers_email", columnList = "email"),
+        @Index(name = "idx_suppliers_phone", columnList = "phone"),
+        @Index(name = "idx_suppliers_active", columnList = "is_active")
+    }
+)
+public class Supplier {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 180)
+    private String name;
+
+    @Column(name = "contact_person", length = 180)
+    private String contactPerson;
+
+    @Column(length = 255)
+    private String email;
+
+    @Column(length = 30)
+    private String phone;
+
+    @Column(columnDefinition = "TEXT")
+    private String address;
+
+    @Column(name = "is_active", nullable = false)
+    private boolean active = true;
+
+    @Version
+    @Column(nullable = false)
+    private Long version;
+
+    @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
+    private Instant createdAt;
+
+    @Column(name = "updated_at", nullable = false, insertable = false, updatable = false)
+    private Instant updatedAt;
+}
+```
+
+Required fields and rules:
+
+| Field | Database | Validation and behavior |
+|---|---|---|
+| `id` | `BIGINT`, identity | Read-only. |
+| `name` | `VARCHAR(180)`, not null | Required, trim before validation/storage. Duplicate detection is practical by normalized name. |
+| `contactPerson` | `VARCHAR(180)`, nullable | Optional. Trim where supplied. |
+| `email` | `VARCHAR(255)`, nullable | Optional; valid RFC-style email syntax. Store trim/lowercase for matching. |
+| `phone` | `VARCHAR(30)`, nullable | Optional; preserve display formatting. |
+| `address` | `TEXT`, nullable | Optional. |
+| `active` | `BOOLEAN`, not null | Starts `true`. Deactivation is soft; never hard delete. |
+| `version` | `BIGINT`, not null | Optimistic-lock update protection. |
+| `createdAt` | `TIMESTAMP`, not null | Server/database-managed. |
+| `updatedAt` | `TIMESTAMP`, not null | Server/database-managed. |
+
+Supplier entities must expose controlled methods such as `updateDetails(...)`, `deactivate()`, and `activate()` rather than unrestricted setters. Activation is not required by the backlog but is useful as the inverse deactivation operation if the repository UI needs the supplier to be restored. If not exposed, do not implement it initially.
+
+### Database migration
+
+Add a versioned migration (for example `V3__supplier_management.sql`) and do not use entity auto-DDL to create supplier tables:
+
+```sql
+CREATE TABLE suppliers (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    name VARCHAR(180) NOT NULL,
+    contact_person VARCHAR(180),
+    email VARCHAR(255),
+    phone VARCHAR(30),
+    address TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    version BIGINT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+
+CREATE INDEX idx_suppliers_name ON suppliers (name);
+CREATE INDEX idx_suppliers_email ON suppliers (email);
+CREATE INDEX idx_suppliers_phone ON suppliers (phone);
+CREATE INDEX idx_suppliers_active ON suppliers (is_active);
+```
+
+Required constraints and operational rules:
+
+- `name` is mandatory.
+- Database uniqueness is not guaranteed for names when differing only in whitespace/case. Store a separate normalized key for race-safe duplicate prevention.
+- Recommended: add `normalized_name VARCHAR(180) NOT NULL` and a unique constraint on `normalized_name`.
+- Email uniqueness is not required by the backlog. Do not impose a database unique constraint on email; duplicates by name and email may still be surfaced as a warning/business conflict.
+- Add foreign-key supplier references to purchase orders in EPIC-04 using `supplier_id BIGINT NOT NULL REFERENCES suppliers(id)`. Supplier deletion must remain prohibited.
+- Use `@Version` and the migration-defined optimistic lock strategy consistently with EPIC-02.
+
+Example normalized-name approach:
+
+```text
+Supplier name: "  Acme  Supplies "
+normalizedName: "acme supplies"
+```
+
+Normalize by trimming, collapsing internal whitespace, and applying lowercase matching. Keep the original display name and the normalized key in separate fields.
+
+## 16.4 Repositories
+
+### SupplierRepository
+
+```java
+public interface SupplierRepository
+        extends JpaRepository<Supplier, Long>, JpaSpecificationExecutor<Supplier> {
+
+    Optional<Supplier> findByNormalizedName(String normalizedName);
+
+    boolean existsByNormalizedName(String normalizedName);
+
+    boolean existsByNormalizedNameAndIdNot(String normalizedName, Long id);
+
+    boolean existsByEmailIgnoreCase(String email);
+
+    boolean existsByEmailIgnoreCaseAndIdNot(String email, Long id);
+
+    Optional<Supplier> findByIdAndActiveTrue(Long id);
+}
+```
+
+Search must use Spring Data specifications or explicit JPQL. Do not fetch suppliers and filter in Java.
+
+Recommended derived/explicit queries:
+
+```text
+findByNormalizedName
+existsByNormalizedName
+existsByNormalizedNameAndIdNot
+existsByEmailIgnoreCase
+existsByEmailIgnoreCaseAndIdNot
+findByIdAndActiveTrue
+```
+
+Search criteria:
+
+```text
+search       String: name, contactPerson, email, or phone
+active       Boolean: default true
+page         int: default 0
+size         int: default 20, maximum 100
+sort         String: default name
+```
+
+Duplicate strategy:
+
+1. Normalize `name` and reject an exact duplicate normalized name as `409 SUPPLIER_NAME_ALREADY_EXISTS`.
+2. Optionally normalize email and reject a duplicate email only as a business warning or conflict; the backlog says duplicate prevention is practical, but email can be shared by separate supplier accounts.
+3. Enforce `normalizedName` unique at the database layer for concurrency safety.
+4. Map `DataIntegrityViolationException` to a consistent duplicate conflict response.
+
+No supplier repository may bypass soft deactivation to return inactive suppliers by default; include inactive suppliers only when `active=false` or `active` is omitted if the API contract defines all-status search explicitly.
+
+## 16.5 DTO Contracts
+
+Use immutable Java records. No request or response DTO may expose JPA entities or lazy relationship state.
+
+### SupplierCreateRequest
+
+```java
+public record SupplierCreateRequest(
+    @NotBlank @Size(max = 180) String name,
+    @Size(max = 180) String contactPerson,
+    @Email @Size(max = 255) String email,
+    @Size(max = 30) String phone,
+    @Size(max = 10000) String address
+) {
+}
+```
+
+### SupplierUpdateRequest
+
+```java
+public record SupplierUpdateRequest(
+    @NotBlank @Size(max = 180) String name,
+    @Size(max = 180) String contactPerson,
+    @Email @Size(max = 255) String email,
+    @Size(max = 30) String phone,
+    @Size(max = 10000) String address
+) {
+}
+```
+
+Do not include `id`, `active`, `version`, `createdAt`, or `updatedAt` in update requests. Optimistic concurrency can use an `If-Match` header later, but EPIC-03 does not require it. Keep `@Version` for persistence protection.
+
+### SupplierResponse
+
+```java
+public record SupplierResponse(
+    Long id,
+    String name,
+    String contactPerson,
+    String email,
+    String phone,
+    String address,
+    boolean active,
+    Long version,
+    Instant createdAt,
+    Instant updatedAt
+) {
+}
+```
+
+### SupplierSearchCriteria
+
+```java
+public record SupplierSearchCriteria(
+    String search,
+    Boolean active,
+    int page,
+    int size,
+    String sort
+) {
+}
+```
+
+### SupplierPurchaseSummaryResponse
+
+The purchase feature will supply one summary row through a projection port:
+
+```java
+public record SupplierPurchaseSummaryResponse(
+    Long purchaseId,
+    String purchaseNumber,
+    Instant orderDate,
+    String status,
+    BigDecimal totalAmount,
+    BigDecimal outstandingAmount,
+    Instant dueDate
+) {
+}
+```
+
+`outstandingAmount` is 0 when EPIC-04 defines no unpaid balance, or must be calculated by EPIC-04 rather than by the supplier service. EPIC-03 must not calculate financial totals in Java from line items.
+
+### SupplierPurchaseHistoryResponse
+
+```java
+public record SupplierPurchaseHistoryResponse(
+    Long supplierId,
+    String supplierName,
+    boolean supplierActive,
+    long totalOrders,
+    BigDecimal totalPurchased,
+    BigDecimal totalOutstanding,
+    List<SupplierPurchaseSummaryResponse> orders
+) {
+}
+```
+
+An exact paginated representation is required for history rather than an unbounded list. Prefer:
+
+```text
+PageResponse<SupplierPurchaseSummaryResponse>
+```
+
+The supplier detail response should not embed purchase history. The history belongs to the dedicated endpoint below.
+
+## 16.6 Mapper
+
+Create `SupplierMapper` as a `@Component`. It may perform entity-to-response mapping and request-to-entity mapping, but it must not read repositories or calculate purchase totals.
+
+## 16.7 Service Contract
+
+```java
+public interface SupplierService {
+
+    SupplierResponse create(SupplierCreateRequest request);
+
+    SupplierResponse getById(Long id);
+
+    PageResponse<SupplierResponse> search(SupplierSearchCriteria criteria);
+
+    SupplierResponse update(Long id, SupplierUpdateRequest request);
+
+    void deactivate(Long id);
+
+    PageResponse<SupplierPurchaseSummaryResponse> getPurchaseHistory(
+        Long supplierId,
+        LocalDate from,
+        LocalDate to,
+        String status,
+        int page,
+        int size,
+        String sort
+    );
+}
+```
+
+Implementation rules:
+
+- `@Transactional` on create, update, and deactivate.
+- `@Transactional(readOnly = true)` on reads and search.
+- Normalize name and email in the service before duplicate checks.
+- Reject duplicate normalized name with `DuplicateResourceException`.
+- Reject missing suppliers with `ResourceNotFoundException`.
+- Deactivation preserves all supplier purchase records and must not delete the supplier.
+- Reject deactivation if a future transaction policy requires it, but do not implement an arbitrary hard-delete restriction.
+- Historical purchase records must remain visible for inactive suppliers.
+- Purchase-history methods verify that the supplier exists first, including inactive suppliers, then delegate to `SupplierPurchaseHistoryReader`.
+- `SupplierPurchaseHistoryReader` returns purchasing-domain projections; supplier code must not join supplier and purchase tables directly.
+
+## 16.8 REST API Contract
+
+### Supplier operations
+
+```text
+POST   /api/suppliers
+GET    /api/suppliers/{id}
+GET    /api/suppliers
+PUT    /api/suppliers/{id}
+PATCH  /api/suppliers/{id}/deactivate
+```
+
+Optional status restoration endpoint:
+
+```text
+PATCH /api/suppliers/{id}/activate
+```
+
+The activate endpoint is not required by the backlog and should only be added if the UI requires restoration. The mandatory implementation is deactivation.
+
+### Purchase history
+
+```text
+GET /api/suppliers/{id}/purchase-history
+```
+
+Supported query parameters:
+
+```text
+from=2026-01-01
+  Optional ISO-8601 LocalDate lower inclusive bound.
+
+  to=2026-12-31
+  Optional ISO-860-1 LocalDate upper inclusive bound.
+
+  status=DRAFT|SUBMITTED|PARTIAL|RECEIVED|CANCELLED
+  Optional purchase status. Accepted values must match EPIC-04 exactly.
+
+  page=0
+  size=20
+  sort=orderDate,desc
+```
+
+The backlog defines `outstanding orders`, but EPIC-04 status names are the authoritative values. EPIC-03 must not invent enum values independently. Implement the status filter as a value-validated enum shared with the purchasing module or a purchasing projection contract.
+
+### Search
+
+```text
+GET /api/suppliers?search=acme&active=true&page=0&size=20&sort=name
+```
+
+- `active=true` is the default.
+- `active=false` returns inactive suppliers.
+- To list both active and inactive suppliers, expose `active` as optional/omittable rather than silently using `false` as “all”; define a clear contract.
+- Recommended default behavior: omitted `active=true`; explicit `active=false` means inactive only; support `active` with no value? No. Add `GET /api/suppliers?all=true` only if product requirements need mixed-status output. Otherwise keep omitted and explicit statuses unambiguous.
+
+### HTTP semantics
+
+| Operation | Success response |
+|---|---:|
+| Create | `201 Created` + `SupplierResponse` + `Location: /api/suppliers/{id}` |
+| Read | `200 OK` + `SupplierResponse` |
+| Search/list | `200 OK` + `PageResponse<SupplierResponse>` |
+| Update | `200 OK` + `SupplierResponse` |
+| Deactivate | `204 No Content` |
+| Purchase history | `200 OK` + `PageResponse<SupplierPurchaseSummaryResponse>` |
+
+Standard failures:
+
+| Failure | Status/code |
+|---|---|
+| Invalid request or malformed date/status | `400 VALIDATION_FAILED` |
+| Missing supplier | `404 RESOURCE_NOT_FOUND` |
+| Duplicate normalized name/email conflict | `409 SUPPLIER_NAME_ALREADY_EXISTS` or `409 SUPPLIER_EMAIL_ALREADY_EXISTS` |
+| Authentication missing | `401 AUTHENTICATION_REQUIRED` |
+| Insufficient role | `403 ACCESS_DENIED` |
+| Database constraint conflict | `409 DATABASE_CONSTRAINT_VIOLATION` |
+
+Supplier create/update should use `SupplierCreateRequest`/`SupplierUpdateRequest` Bean Validation. Email should be nullable: `@Email` must allow null/blank when the field is optional, and the service should convert blank values to `null`.
+
+## 16.9 Authorization Matrix
+
+Use `@PreAuthorize` on controller or service methods:
+
+| Operation | Roles |
+|---|---|
+| Supplier lookup/list/history | `ADMIN`, `MANAGER`, `INVENTORY_STAFF` |
+| Supplier create/update | `ADMIN`, `MANAGER`, `INVENTORY_STAFF` |
+| Supplier deactivate/activate | `ADMIN`, `MANAGER` |
+
+Sales staff do not maintain or purchase from suppliers under the EPIC-03 and role matrix. Keep authorization server-side and do not return suppliers to sales staff unless a separate read requirement is approved.
+
+## 16.10 Purchase History Dependency and Ordering
+
+EPIC-03 can be implemented in two slices:
+
+1. **Supplier master data slice**: entity, migration, repository, DTOs, mapper, service, controller, validation, authorization, and tests.
+2. **Purchase history slice**: requires EPIC-04 purchase order entity and repository/projection to exist.
+
+Do not create a `PurchaseOrder` placeholder solely for EPIC-03. Until EPIC-04 exists, implement the history endpoint behind a clearly named port with a zero-order adapter or return `501 Not Implemented`. `501` is preferable to fabricated purchase data and must not be treated as success. Do not permanently leave the endpoint enabled with empty data.
+
+EPIC-04 must establish:
+
+- Purchase order/supplier relationship: `ManyToOne Supplier` or a non-ORM supplier ID at the persistence boundary.
+- Unique purchase order number.
+- Stable purchase status enum.
+- Persisted order date and total amount.
+- A purchase projection/query that calculates or exposes `totalAmount`, status, and outstanding balance.
+- Referential integrity to suppliers.
+- Historical visibility for inactive suppliers.
+
+The preferred read flow is:
+
+```text
+SupplierController
+  -> SupplierService
+  -> SupplierPurchaseHistoryReader (supplier port)
+  -> purchasing implementation/repository projection
+  -> PageResponse<SupplierPurchaseSummaryResponse>
+```
+
+## 16.11 Testing Requirements
+
+### SupplierServiceTest
+
+Cover:
+
+- Successful supplier creation.
+- Supplier name required and whitespace rejected.
+- Valid optional email accepted.
+- Blank email normalized to `null`.
+- Invalid email rejected.
+- Duplicate normalized name rejected.
+- Duplicate email behavior according to the approved policy.
+- Update successful.
+- Update to duplicate name rejected.
+- Missing supplier on read/update/deactivate rejected.
+- Deactivation is preserved and not deleted.
+- Active supplier search only.
+- Inactive supplier remains visible by explicit status filter.
+- Purchase history for inactive supplier remains accessible.
+
+### SupplierControllerTest
+
+Use `@WebMvcTest` to verify:
+
+- `201`, `200`, `204`, `400`, `404`, `409`, `401`, and `403` behavior.
+- Location header for creation.
+- Request validation and nullable email handling.
+- JSON fields; no JPA entities or passwords.
+- Pagination and date/status query validation.
+- Method-level authorization.
+
+### SupplierRepositoryTest
+
+Use MySQL-compatible integration tests to verify:
+
+- Unique normalized name constraint.
+- Case-insensitive/normalized duplicate detection.
+- Pagination and database-side search.
+- Active/inactive filtering.
+- Optimistic lock protection.
+- Soft deactivation.
+- Supplier remains referenced by historical purchase records when implemented.
+
+## 16.12 Definition of Ready for EPIC-03
+
+Before coding EPIC-03:
+
+- [ ] Supplier normalized-name and display-name strategy is approved.
+- [ ] Duplicate email behavior is approved (warn or reject).
+- [ ] Default active-status search behavior is approved.
+- [ ] Activation endpoint is included or explicitly excluded.
+- [ ] EPIC-04 purchase status names and outstanding balance definition are agreed.
+- [ ] Purchase history endpoint pagination and sort fields are approved.
+- [ ] Migration mechanism and supplier table constraints are approved.
+- [ ] Authorization matrix is approved.
+- [ ] Soft deactivation, not hard deletion, is confirmed.
+- [ ] Contract tests are listed for supplier history and inactive suppliers.
