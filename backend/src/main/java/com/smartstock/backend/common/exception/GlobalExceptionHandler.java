@@ -5,6 +5,8 @@ import jakarta.validation.ConstraintViolationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -12,6 +14,7 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -51,6 +54,14 @@ public class GlobalExceptionHandler {
         return response(HttpStatus.NOT_FOUND, exception.getCode(), exception.getMessage(), request, List.of());
     }
 
+    @ExceptionHandler(InvalidRequestException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidRequest(
+        InvalidRequestException exception, HttpServletRequest request
+    ) {
+        return response(HttpStatus.BAD_REQUEST, ErrorCode.VALIDATION_FAILED.name(),
+            exception.getMessage(), request, List.of());
+    }
+
     @ExceptionHandler(DuplicateResourceException.class)
     public ResponseEntity<ErrorResponse> handleDuplicate(
         DuplicateResourceException exception, HttpServletRequest request
@@ -72,6 +83,22 @@ public class GlobalExceptionHandler {
         log.warn("Database constraint violation at {}", request.getRequestURI(), exception);
         return response(HttpStatus.CONFLICT, ErrorCode.DATABASE_CONSTRAINT_VIOLATION.name(),
             "The request conflicts with existing data.", request, List.of());
+    }
+
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handleOptimisticLock(
+        OptimisticLockingFailureException exception, HttpServletRequest request
+    ) {
+        return response(HttpStatus.CONFLICT, ErrorCode.CONCURRENT_MODIFICATION.name(),
+            "The resource was changed by another request. Reload it and retry.", request, List.of());
+    }
+
+    @ExceptionHandler(PessimisticLockingFailureException.class)
+    public ResponseEntity<ErrorResponse> handlePessimisticLock(
+        PessimisticLockingFailureException exception, HttpServletRequest request
+    ) {
+        return response(HttpStatus.CONFLICT, ErrorCode.INVENTORY_CONFLICT.name(),
+            "The resource is being changed by another request. Retry shortly.", request, List.of());
     }
 
     @ExceptionHandler(AccessDeniedException.class)
@@ -96,6 +123,14 @@ public class GlobalExceptionHandler {
     ) {
         return response(HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST.name(),
             "The request body is malformed.", request, List.of());
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ErrorResponse> handleTypeMismatch(
+        MethodArgumentTypeMismatchException exception, HttpServletRequest request
+    ) {
+        return response(HttpStatus.BAD_REQUEST, ErrorCode.VALIDATION_FAILED.name(),
+            "The value for '" + exception.getName() + "' is invalid.", request, List.of());
     }
 
     @ExceptionHandler(Exception.class)

@@ -1,10 +1,11 @@
 package com.smartstock.backend.supplier.service;
 
-import com.smartstock.backend.common.exception.BusinessRuleException;
 import com.smartstock.backend.common.exception.DuplicateResourceException;
+import com.smartstock.backend.common.exception.InvalidRequestException;
 import com.smartstock.backend.common.exception.ResourceNotFoundException;
 import com.smartstock.backend.common.web.PageResponse;
 import com.smartstock.backend.supplier.dto.SupplierCreateRequest;
+import com.smartstock.backend.supplier.dto.SupplierPurchaseSummaryResponse;
 import com.smartstock.backend.supplier.dto.SupplierResponse;
 import com.smartstock.backend.supplier.dto.SupplierSearchCriteria;
 import com.smartstock.backend.supplier.dto.SupplierUpdateRequest;
@@ -414,8 +415,8 @@ class SupplierServiceTest {
     void purchaseHistoryRejectsInvalidDateRange() {
         when(supplierRepository.findById(1L)).thenReturn(Optional.of(supplier));
 
-        BusinessRuleException exception =
-            assertThrows(BusinessRuleException.class,
+        InvalidRequestException exception =
+            assertThrows(InvalidRequestException.class,
                 () -> supplierService.getPurchaseHistory(
                     1L,
                     LocalDate.of(2026, 12, 1),
@@ -426,7 +427,29 @@ class SupplierServiceTest {
                     "orderDate,desc"
                 ));
 
-        assertEquals("PURCHASE_HISTORY_INVALID_DATE_RANGE", exception.getCode());
+        assertEquals("The from date must not be after the to date.", exception.getMessage());
         verifyNoInteractions(purchaseHistoryReader);
     }
-} 
+
+    @Test
+    void purchaseHistoryDelegatesExactPartialStatusForInactiveSupplier() {
+        supplier.deactivate();
+        PageResponse<SupplierPurchaseSummaryResponse> expected =
+            new PageResponse<>(List.of(), 0, 20, 0, 0);
+        when(supplierRepository.findById(1L)).thenReturn(Optional.of(supplier));
+        when(purchaseHistoryReader.getHistory(
+            eq(1L), ArgumentMatchers.isNull(), ArgumentMatchers.isNull(),
+            eq("PARTIALLY_RECEIVED"), eq(0), eq(20), eq("orderDate,desc")
+        )).thenReturn(expected);
+
+        PageResponse<SupplierPurchaseSummaryResponse> result = supplierService.getPurchaseHistory(
+            1L, null, null, "PARTIALLY_RECEIVED", 0, 20, "orderDate,desc"
+        );
+
+        assertSame(expected, result);
+        verify(purchaseHistoryReader).getHistory(
+            eq(1L), ArgumentMatchers.isNull(), ArgumentMatchers.isNull(),
+            eq("PARTIALLY_RECEIVED"), eq(0), eq(20), eq("orderDate,desc")
+        );
+    }
+}

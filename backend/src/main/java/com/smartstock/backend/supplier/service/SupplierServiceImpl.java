@@ -1,7 +1,7 @@
 package com.smartstock.backend.supplier.service;
 
-import com.smartstock.backend.common.exception.BusinessRuleException;
 import com.smartstock.backend.common.exception.DuplicateResourceException;
+import com.smartstock.backend.common.exception.InvalidRequestException;
 import com.smartstock.backend.common.exception.ResourceNotFoundException;
 import com.smartstock.backend.common.web.PageResponse;
 import com.smartstock.backend.supplier.dto.SupplierCreateRequest;
@@ -28,7 +28,7 @@ import java.util.Set;
 @Service
 public class SupplierServiceImpl implements SupplierService {
     private static final Set<String> PURCHASE_STATUSES = Set.of(
-        "DRAFT", "SUBMITTED", "PARTIAL", "RECEIVED", "CANCELLED"
+        "DRAFT", "SUBMITTED", "PARTIALLY_RECEIVED", "RECEIVED", "CANCELLED"
     );
 
     private final SupplierRepository supplierRepository;
@@ -108,12 +108,12 @@ public class SupplierServiceImpl implements SupplierService {
     ) {
         findSupplier(supplierId);
         if (from != null && to != null && from.isAfter(to)) {
-            throw new BusinessRuleException("PURCHASE_HISTORY_INVALID_DATE_RANGE", "The from date must not be after the to date.");
+            throw new InvalidRequestException("The from date must not be after the to date.");
         }
         if (status != null && !status.isBlank()) {
             String normalizedStatus = status.trim().toUpperCase(Locale.ROOT);
             if (!PURCHASE_STATUSES.contains(normalizedStatus)) {
-                throw new BusinessRuleException("PURCHASE_HISTORY_INVALID_STATUS", "The purchase status filter is invalid.");
+                throw new InvalidRequestException("The purchase status filter is invalid.");
             }
             status = normalizedStatus;
         } else {

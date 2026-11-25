@@ -186,6 +186,13 @@ CREATE TABLE IF NOT EXISTS purchase_order_items (
     UNIQUE KEY uk_purchase_order_product (purchase_order_id, product_id)
 ) ENGINE=InnoDB;
 
+ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+ALTER TABLE purchase_orders ADD INDEX IF NOT EXISTS idx_purchase_orders_supplier_date (supplier_id, order_date);
+ALTER TABLE purchase_orders ADD INDEX IF NOT EXISTS idx_purchase_orders_status_date (status, order_date);
+
 CREATE TABLE IF NOT EXISTS goods_receipts (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     purchase_order_id BIGINT NOT NULL,
@@ -199,6 +206,25 @@ CREATE TABLE IF NOT EXISTS goods_receipts (
         FOREIGN KEY (received_by) REFERENCES users (id),
     INDEX idx_goods_receipts_received_at (received_at)
 ) ENGINE=InnoDB;
+
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS received_by_username VARCHAR(80);
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS status_after_receipt VARCHAR(24);
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128);
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS request_hash VARCHAR(64);
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE goods_receipts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP;
+UPDATE goods_receipts gr
+JOIN users u ON u.id = gr.received_by
+SET gr.received_by_username = u.username
+WHERE gr.received_by_username IS NULL;
+UPDATE goods_receipts gr
+JOIN purchase_orders po ON po.id = gr.purchase_order_id
+SET gr.status_after_receipt = po.status
+WHERE gr.status_after_receipt IS NULL;
+ALTER TABLE goods_receipts MODIFY COLUMN received_by_username VARCHAR(80) NOT NULL;
+ALTER TABLE goods_receipts MODIFY COLUMN status_after_receipt VARCHAR(24) NOT NULL;
+ALTER TABLE goods_receipts ADD UNIQUE INDEX IF NOT EXISTS uk_goods_receipts_idempotency_key (idempotency_key);
+ALTER TABLE goods_receipts ADD INDEX IF NOT EXISTS idx_goods_receipts_purchase_received (purchase_order_id, received_at);
 
 CREATE TABLE IF NOT EXISTS goods_receipt_items (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
@@ -220,6 +246,9 @@ CREATE TABLE IF NOT EXISTS goods_receipt_items (
     )
 ) ENGINE=InnoDB;
 
+ALTER TABLE goods_receipt_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE goods_receipt_items ADD UNIQUE INDEX IF NOT EXISTS uk_goods_receipt_order_item (goods_receipt_id, purchase_order_item_id);
+
 CREATE TABLE IF NOT EXISTS inventory_balances (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     product_id BIGINT NOT NULL UNIQUE,
@@ -233,6 +262,8 @@ CREATE TABLE IF NOT EXISTS inventory_balances (
         AND quantity_reserved <= quantity_on_hand
     )
 ) ENGINE=InnoDB;
+
+ALTER TABLE inventory_balances ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sales (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
