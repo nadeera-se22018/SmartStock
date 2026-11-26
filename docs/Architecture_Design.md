@@ -2011,3 +2011,359 @@ Before coding EPIC-04:
 - [ ] A MySQL migration mechanism and migration numbering are approved.
 - [ ] Concurrent receipt behavior uses optimistic/pessimistic locking without over-receipt.
 - [ ] Contract tests include supplier purchase history and inactive suppliers.
+
+---
+
+# 18. Phase 3 Architecture — EPIC-05 Inventory Management
+
+## 18.1 Scope and Boundaries
+
+EPIC-05 delivers:
+
+1. Authoritative per-product inventory balances.
+2. Immutable, append-only stock movements with the five backlog movement types.
+3. Paginated balance and movement reads, including low-stock and out-of-stock filters.
+4. Authorized manual stock-in and stock-out adjustments with a required reason.
+5. Transactional stock updates with row locking and no negative available stock.
+6. Completion of the existing `ProductStockReader` and `InventoryReceivingPort` integrations.
+7. Service, controller, repository, authorization, and transaction tests.
+
+The inventory module owns `inventory_balances` and `stock_movements`. Purchasing owns goods receipts and calls the existing `InventoryReceivingPort`; it must not write inventory entities itself. EPIC-05 does not implement sales or sale-return workflows. `SALE` and `SALE_RETURN` are supported ledger types for EPIC-07/08 to use through a transactional inventory application boundary.
+
+Preserve the existing feature-oriented layered design, DTO-only HTTP boundary, `@Transactional` write operations, `@Transactional(readOnly = true)` reads, common `ErrorResponse` handling, and `PageResponse<T>` pagination.
+
+## 18.2 Package Structure
+
+Add the following under `backend/src/main/java/com/smartstock/backend/inventory/`; retain the existing `entity`, `adapter`, and `repository` classes:
+
+```text
+inventory/
+├── adapter/
+│   ├── InventoryProductStockReader.java
+│   └── PurchaseReceiptInventoryAdapter.java
+├── controller/
+│   └── InventoryController.java
+├── dto/
+│   ├── InventoryBalanceResponse.java
+│   ├── InventorySearchCriteria.java
+│   ├── StockAdjustmentRequest.java
+│   ├── StockAdjustmentDirection.java
+│   ├── StockMovementResponse.java
+│   └── StockMovementSearchCriteria.java
+├── entity/
+│   ├── InventoryBalance.java
+│   ├── StockMovement.java
+│   └── StockMovementType.java
+├── mapper/
+│   └── InventoryMapper.java
+├── repository/
+│   ├── InventoryBalanceRepository.java
+│   ├── StockMovementProjection.java
+│   └── StockMovementRepository.java
+└── service/
+    ├── InventoryService.java
+    └── InventoryServiceImpl.java
+```
+
+`InventoryProductStockReader` and `PurchaseReceiptInventoryAdapter` already exist and are the integration points, not duplicate implementations to replace.
+
+## 18.3 Entities and Database Tables
+
+Use the existing tables and entity names. Quantities remain `BigDecimal` / `DECIMAL(19,4)`, matching the current schema. Reject values with more than four fractional digits rather than silently rounding stock.
+
+### `InventoryBalance` / `inventory_balances`
+
+One row per product, created lazily on the first stock mutation. A missing row represents zero stock in all read paths.
+
+| Column | Type | Constraints / meaning |
+|---|---|---|
+| `id` | `BIGINT` | Primary key, auto-increment |
+| `product_id` | `BIGINT` | Required FK to `products.id`, unique; no cascade delete |
+| `quantity_on_hand` | `DECIMAL(19,4)` | Required, default `0.0000`, must be `>= 0` |
+| `quantity_reserved` | `DECIMAL(19,4)` | Required, default `0.0000`, must be `>= 0` and `<= quantity_on_hand` |
+| `version` | `BIGINT` | Required, default `0`; JPA `@Version` |
+| `updated_at` | `TIMESTAMP` | Required, database-updated timestamp |
+
+`quantity_reserved` is already part of the schema and is not changed by EPIC-05. It remains zero until a separately approved reservation workflow exists. `available_quantity = quantity_on_hand - quantity_reserved`. Stock-out operations must preserve both `quantity_on_hand >= 0` and `quantity_on_hand >= quantity_reserved`, so available stock cannot become negative.
+
+Do not physically delete products or balance rows. A deactivated product remains readable in its balance and movement history; new manual adjustments and purchase receipts continue to reject inactive products as required by the existing receiving behavior.
+
+### `StockMovement` / `stock_movements`
+
+One append-only row records each product-level stock change. For a multi-product purchase receipt, write one movement per product after aggregating receipt lines by product ID.
+
+| Column | Type | Constraints / meaning |
+|---|---|---|
+| `id` | `BIGINT` | Primary key, auto-increment |
+| `product_id` | `BIGINT` | Required FK to `products.id`; no cascade delete |
+| `performed_by` | `BIGINT` | Required FK to `users.id`; set from the authenticated principal, never request JSON |
+| `movement_type` | enum/string, max 32 | Required; exact values below |
+| `quantity` | `DECIMAL(19,4)` | Required positive magnitude; never store a signed amount |
+| `quantity_before` | `DECIMAL(19,4)` | Required and non-negative |
+| `quantity_after` | `DECIMAL(19,4)` | Required and non-negative |
+| `reference_type` | `VARCHAR(50)` | Optional source type, e.g. `GOODS_RECEIPT`, `SALE`, `SALE_RETURN`, `INVENTORY_ADJUSTMENT` |
+| `reference_id` | `BIGINT` | Optional source record ID; polymorphic reference, not a cross-module FK |
+| `reason` | `VARCHAR(255)` | Required and non-blank for `ADJUSTMENT_IN` / `ADJUSTMENT_OUT`; source-generated for purchase receipts |
+| `created_at` | `TIMESTAMP` | Required, database-generated; immutable |
+| `idempotency_key` | `VARCHAR(128)` | Recommended nullable unique key for manual adjustments; null for non-adjustment movements |
+| `request_hash` | `CHAR(64)` | Required when `idempotency_key` is set; hash of normalized adjustment fields |
+
+Movement types and balance equation:
+
+| Type | Meaning | Required relation |
+|---|---|---|
+| `PURCHASE_RECEIPT` | Goods received against a persisted goods receipt | `after = before + quantity` |
+| `SALE` | Stock issued for a completed sale (future EPIC-07 caller) | `after = before - quantity` |
+| `SALE_RETURN` | Stock restored for an accepted sale return (future EPIC-08 caller) | `after = before + quantity` |
+| `ADJUSTMENT_IN` | Positive manual correction | `after = before + quantity` |
+| `ADJUSTMENT_OUT` | Negative manual correction | `after = before - quantity` |
+
+Add database checks for positive movement quantity, non-negative before/after quantities, and the type-specific before/after equation. Add a check requiring `TRIM(reason)` to be non-empty for both adjustment types. Keep the existing product/date and reference indexes; add indexes for `(movement_type, created_at)` and `idempotency_key` if the chosen database does not create one for its unique constraint. No application endpoint or repository operation may update or delete a movement.
+
+For manual adjustments, use `reference_type = 'INVENTORY_ADJUSTMENT'` and no `reference_id` (the movement is the adjustment record); do not introduce a separate adjustment header table for a single-product adjustment. For purchase receipts, preserve `reference_type = 'GOODS_RECEIPT'` and `reference_id = goods_receipt_id`; include the purchase-order number/ID in the generated reason as the current adapter does.
+
+The movement row is the inventory-specific audit record: it contains actor, timestamp, reason, reference, and before/after values. If EPIC-10 later requires a second general-purpose `audit_logs` event, write it in the same transaction; it must not replace or be the only stock ledger.
+
+## 18.4 Stock Invariants and Transaction/Locking Rules
+
+All mutation paths, including purchase receipt, manual adjustment, and future sale/return callers, must use the same inventory service/application boundary and the following rules:
+
+1. Require one active product per adjustment and a positive quantity with at most four fractional digits. Reject zero, negative request quantity, overflow, and excessive scale with `400 VALIDATION_FAILED`.
+2. Normalize/validate the source and actor in the service. Derive `performed_by` from the authenticated user; do not accept it from a DTO.
+3. Start one database transaction. Lock the product row first using `ProductRepository.findByIdForUpdate`, sorted by increasing product ID for batch changes. Validate it exists and is active.
+4. Then acquire the product's `InventoryBalance` with `InventoryBalanceRepository.findByProductIdForUpdate`. If no row exists, create it at zero while still holding the product lock. Every inventory writer must use this product-before-balance lock order; this serializes first-row creation and avoids deadlocks between multi-product operations.
+5. Compute `before` from the locked balance and calculate `after` using exact `BigDecimal` arithmetic. For stock-out, reject if `after < 0` or `after < quantity_reserved`; do not clamp, floor, or partially apply the requested quantity. Return `409 INVENTORY_STOCK_INSUFFICIENT`.
+6. Persist the new balance and its movement in the same transaction. Flush/constraint failures and any later exception roll back both. The movement must satisfy the equation for its type.
+7. Retain `@Version` as a second line of defense and translate locking/version conflicts to the existing `409 INVENTORY_CONFLICT` / `409 CONCURRENT_MODIFICATION` response.
+8. Never edit/delete a movement to correct a mistake; post a compensating movement with a new reason and reference.
+
+Use pessimistic write locks for predictable serialized inventory changes. `@Version` alone is not sufficient for the absent-balance case. Locking the product first is essential because `SELECT ... FOR UPDATE` cannot lock a balance row that does not yet exist.
+
+For an adjustment retried with the same `Idempotency-Key`, return the original movement with `200 OK` only if the normalized product, direction, quantity, and reason hash match; otherwise return `409 DUPLICATE_RESOURCE`. Keys are scoped globally as a unique database value. This follows the retry-safety pattern already used for goods receipts; if the product chooses not to require this header, explicitly accept duplicate POST risk before implementation.
+
+## 18.5 Integration Contracts
+
+### Product availability: `ProductStockReader`
+
+Keep the existing product-owned port unchanged:
+
+```java
+public interface ProductStockReader {
+    BigDecimal getAvailableQuantity(Long productId);
+}
+```
+
+`InventoryProductStockReader` is its implementation. It reads `quantity_on_hand - quantity_reserved`, returns `BigDecimal.ZERO` when the product has no balance row, and performs no insert or mutation. Keep it `@Transactional(readOnly = true)`. `ProductService` continues to use this port to populate `ProductResponse.availableQuantity`; product code must not query inventory repositories directly.
+
+The current one-product method can produce one inventory query per product in a product search page. If that path becomes material at the expected page size, add a batch method to the port and batch implementation as a separately verified optimization; do not change the meaning of the existing method.
+
+### Purchasing: `PurchaseReceiptInventoryAdapter`
+
+Keep `purchasing.port.InventoryReceivingPort` and its `PurchaseReceiptLine` / `InventoryReceivingResult` contract as the cross-feature boundary. `PurchaseServiceImpl.receiveGoods` already calls the adapter inside the goods-receipt transaction. The adapter must:
+
+- retain `@Transactional(propagation = Propagation.MANDATORY)`; never use `REQUIRES_NEW`;
+- aggregate repeated product lines and process product IDs in stable ascending order;
+- lock/validate product rows, then lock or create balances, then update each balance and append one `PURCHASE_RECEIPT` movement;
+- use the authenticated receiving user ID supplied by Purchasing, set the receipt reference and generated reason, and return resulting on-hand quantities;
+- propagate all exceptions so the parent transaction rolls back receipt, receipt items, received quantities, purchase status, balances, and movements together.
+
+The EPIC-04 test `GoodsReceivingTransactionTest` remains the cross-module regression test. EPIC-05 must not make purchase receipt mutation separately callable as an inventory REST operation.
+
+For EPIC-07/08, add similarly narrow purchase-owned/sales-owned ports to call the inventory application service within their existing business transactions. Do not have controllers write `SALE`/`SALE_RETURN` movements or allow generic movement-type input on the adjustment API.
+
+## 18.6 Repositories and Service
+
+`InventoryBalanceRepository` retains:
+
+```java
+Optional<InventoryBalance> findByProductId(Long productId);
+Optional<InventoryBalance> findByProductIdForUpdate(Long productId);
+```
+
+Add a database-side pageable balance query/projection joining products and left-joining balances, so products without a balance appear as zero. Apply low-stock filtering using the backlog rule `quantity_on_hand <= product.reorder_level`; out of stock is `quantity_on_hand = 0`. Keep filtering and sorting in SQL, not Java stream processing. Allowlist sort fields such as `sku`, `name`, `quantityOnHand`, `availableQuantity`, `reorderLevel`, and `updatedAt`.
+
+`StockMovementRepository` adds pageable filters for product, movement type, reference type/ID, and inclusive `from`/`to` timestamps. Use an allowlist for sorting, default `createdAt,desc`, and retain deterministic `id,desc` as a tie-breaker.
+
+Restrict the movement repository surface to reads and insertion rather than inheriting destructive CRUD methods:
+
+```java
+public interface StockMovementRepository extends Repository<StockMovement, Long> {
+    <S extends StockMovement> S save(S movement);
+    Optional<StockMovement> findById(Long id);
+    Optional<StockMovement> findByIdempotencyKey(String idempotencyKey);
+    Page<StockMovementProjection> search(StockMovementSearchCriteria criteria, Pageable pageable);
+}
+```
+
+The service saves only newly constructed movement entities; it never re-saves a loaded movement.
+
+Service interface:
+
+```java
+public interface InventoryService {
+    PageResponse<InventoryBalanceResponse> searchBalances(InventorySearchCriteria criteria);
+    InventoryBalanceResponse getBalance(Long productId);
+    PageResponse<StockMovementResponse> searchMovements(StockMovementSearchCriteria criteria);
+    StockMovementResponse getMovement(Long movementId);
+    StockMovementResponse adjust(StockAdjustmentRequest request, String idempotencyKey);
+}
+```
+
+The service owns product resolution, adjustment validation, lock order, before/after calculation, idempotency replay/conflict behavior, persistence, and entity-to-response mapping. Controllers do not access repositories or contain inventory rules. Read service methods are `@Transactional(readOnly = true)`; `adjust` is `@Transactional`.
+
+## 18.7 DTO Contracts
+
+Use immutable Java records and `BigDecimal`; never serialize entities.
+
+```java
+public record StockAdjustmentRequest(
+    @NotNull Long productId,
+    @NotNull StockAdjustmentDirection direction, // IN or OUT; not a movement type
+    @NotNull @DecimalMin(value = "0.0001") BigDecimal quantity,
+    @NotBlank @Size(max = 255) String reason
+) {}
+```
+
+Normalize `reason` by trimming and reject if blank after trim. Reject quantity scale greater than four; do not round. `direction` maps internally to `ADJUSTMENT_IN` / `ADJUSTMENT_OUT`. Idempotency key is an HTTP header, not a JSON field.
+
+`InventoryBalanceResponse` fields:
+
+```text
+productId, sku, barcode, productName,
+quantityOnHand, quantityReserved, availableQuantity, reorderLevel,
+lowStock, outOfStock, updatedAt
+```
+
+`lowStock` means `quantityOnHand <= reorderLevel`; `outOfStock` means `quantityOnHand == 0`. A missing balance returns zero quantities and a null `updatedAt`.
+
+`StockMovementResponse` fields:
+
+```text
+id, productId, sku, productName, movementType, quantity,
+quantityBefore, quantityAfter, referenceType, referenceId,
+reason, performedByUserId, performedByUsername, createdAt
+```
+
+Resolve the username for display through a projection/join; keep `performed_by` as the required FK in the movement table. Do not expose password, role, or other user internals.
+
+## 18.8 REST API Contract
+
+Base path: `/api/inventory`.
+
+| Method and path | Behavior | Success |
+|---|---|---|
+| `GET /balances` | Paginated balances; filters `search`, `categoryId`, `active`, `stockStatus=LOW_STOCK\|OUT_OF_STOCK`, `page`, `size`, `sort` | `200 PageResponse<InventoryBalanceResponse>` |
+| `GET /balances/{productId}` | Current balance; missing balance for an existing product is zero | `200 InventoryBalanceResponse` |
+| `POST /adjustments` | Manual IN/OUT adjustment; requires `Idempotency-Key` (36-128 chars) | `201 StockMovementResponse`, `Location: /api/inventory/movements/{id}` |
+| `GET /movements` | Paginated ledger; filters `productId`, `movementType`, `referenceType`, `referenceId`, `from`, `to`, `page`, `size`, `sort` | `200 PageResponse<StockMovementResponse>` |
+| `GET /movements/{movementId}` | Read one immutable movement | `200 StockMovementResponse` |
+
+Use existing pagination bounds (`page >= 0`, `1 <= size <= 100`), inclusive ISO-8601 date/time filters, reject `from > to`, and reject unsupported movement types, stock status, or sort fields with `400 VALIDATION_FAILED`. Never add `PUT` or `DELETE` for stock movements. No balance-write endpoint is exposed; manual stock changes go only through `POST /adjustments`.
+
+Example adjustment:
+
+```http
+POST /api/inventory/adjustments
+Idempotency-Key: 2cc8db44-9213-4f69-9289-6548d67ed2e1
+Content-Type: application/json
+
+{
+  "productId": 101,
+  "direction": "OUT",
+  "quantity": 2.0000,
+  "reason": "Physical count correction"
+}
+```
+
+The response contains the persisted movement with `movementType: "ADJUSTMENT_OUT"`, `quantityBefore`, and `quantityAfter`; it does not accept a client-supplied actor or before/after values.
+
+Use the existing `ErrorResponse` envelope:
+
+| Failure | Status / code |
+|---|---|
+| Invalid/missing fields, date range, scale, filter or pagination | `400 VALIDATION_FAILED` |
+| Missing product or movement | `404 RESOURCE_NOT_FOUND` |
+| Inactive product or insufficient stock | `409` with stable inventory-specific business code (`INVENTORY_PRODUCT_INACTIVE`, `INVENTORY_STOCK_INSUFFICIENT`) |
+| Reused key with a different normalized request | `409 DUPLICATE_RESOURCE` |
+| Lock/deadlock/version conflict | `409 INVENTORY_CONFLICT` or `409 CONCURRENT_MODIFICATION` |
+| Missing authentication / insufficient role | `401 AUTHENTICATION_REQUIRED` / `403 ACCESS_DENIED` |
+| Database constraint conflict | `409 DATABASE_CONSTRAINT_VIOLATION` |
+
+Add stable inventory codes through the existing exception types and `GlobalExceptionHandler`; do not create controller-specific error JSON.
+
+## 18.9 Authorization
+
+Apply server-side method authorization using existing `@EnableMethodSecurity` and role naming:
+
+| Operation | Roles |
+|---|---|
+| Read balances and movement ledger | `ADMIN`, `MANAGER`, `INVENTORY_STAFF` |
+| Create manual adjustments | `ADMIN`, `INVENTORY_STAFF` |
+| Purchase receipt inventory mutation | Called only by Purchasing under its existing receipt authorization and transaction |
+| Sale / sale-return mutation | Not exposed in EPIC-05; future sales/returns services authorize their own operations |
+
+`MANAGER` may inspect balances and ledger but cannot create goods receipts or adjustments by default; this aligns adjustment authority with the existing goods-receiving policy. `SALES_STAFF` does not receive direct inventory endpoints. They consume availability only through authorized product/sales workflows. The authenticated principal is the source of `performedBy`.
+
+## 18.10 Schema Evolution
+
+The current backend has an existing `schema.sql` with both inventory tables, and `pom.xml` does not currently declare Flyway. EPIC-05 should extend the current schema initialization convention with the missing movement constraints/idempotency columns and indexes, rather than assuming an uninstalled numbered-migration system. Do not introduce Flyway solely for this feature without an explicit repository-level migration decision.
+
+If existing databases contain movement rows that violate a new check or use an unsupported enum spelling, audit/backfill those rows before enabling the constraint. Preserve the existing unique product balance key, version column, FKs, and indexes.
+
+## 18.11 Testing Requirements
+
+### `InventoryServiceTest`
+
+- Balance mapping returns zero for a product without a row and computes available as on-hand minus reserved.
+- Low-stock and out-of-stock boundaries exactly match the backlog (`<= reorderLevel`, `== 0`).
+- Valid adjustment IN and OUT produce correct movement types and before/after equations.
+- Missing/inactive product, zero/negative quantity, scale greater than four, blank/oversized reason, and out-of-range precision are rejected.
+- Stock-out below zero or below reserved quantity is rejected without changing balance or ledger.
+- Actor always comes from authentication and cannot be supplied by the request.
+- Identical idempotency replay returns the original movement; conflicting replay is rejected.
+- Repository or movement persistence failure rolls back the balance update.
+- Movement history cannot be changed through service operations.
+
+### `InventoryControllerTest`
+
+Use `@WebMvcTest` with method security:
+
+- Verify `200`, `201`, `400`, `404`, `409`, `401`, and `403` responses and the existing `ErrorResponse` shape.
+- Verify adjustment `Location`, header validation, request validation, and no actor/before/after fields are accepted from JSON.
+- Verify pagination, inclusive time filters, allowlisted sort fields, and exact enum values.
+- Verify ADMIN/INVENTORY_STAFF can adjust, MANAGER can read but cannot adjust, and SALES_STAFF cannot use inventory endpoints.
+- Verify no mutation route exists for editing/deleting movement rows.
+
+### `InventoryRepositoryTest`
+
+Use MySQL-compatible integration tests:
+
+- Unique `inventory_balances.product_id`, non-negative balance/reserved checks, and FK constraints.
+- Movement type enum and arithmetic/positive-quantity/reason checks.
+- Movement immutability at service/API boundary and stable pagination/indexed filters.
+- Low-stock/out-of-stock SQL filters, including products without a balance row.
+- Idempotency-key uniqueness and duplicate-key races.
+- Pessimistic locking serializes concurrent stock-out requests; at most one may consume the same available units.
+- Concurrent first mutations for a product create exactly one balance row.
+- Multi-product mutations lock products in deterministic order and do not deadlock under the test workload.
+
+### Cross-module transaction tests
+
+Extend `GoodsReceivingTransactionTest` to verify:
+
+- Existing receipt path creates one `PURCHASE_RECEIPT` movement per product with correct reference, actor, reason, and before/after quantities.
+- Repeated receipt idempotency does not increment balance or append a second movement.
+- Adapter requires an existing transaction; adapter failures roll back receipt, purchase status, balance, and movement.
+- `InventoryProductStockReader` returns available quantity after receipt and zero for products without a balance.
+- Product create/search/read DTOs continue to use the `ProductStockReader` boundary without direct inventory repository coupling.
+
+## 18.12 Definition of Ready for EPIC-05
+
+- [ ] Four-decimal quantity precision and rejection (not rounding) policy are accepted.
+- [ ] `quantity_reserved` remains read-only/zero until reservation rules are approved.
+- [ ] Manual adjustment roles are accepted (`ADMIN`, `INVENTORY_STAFF`); managers are read-only.
+- [ ] The adjustment `Idempotency-Key` requirement and replay semantics are accepted.
+- [ ] Adjustment reason length and reference conventions are accepted.
+- [ ] Existing `schema.sql` evolution is accepted, or a repository-wide migration mechanism is selected.
+- [ ] Existing inventory rows are checked before adding arithmetic/reason constraints.
+- [ ] Sale and return integration remain owned by EPIC-07/08 and use the inventory transaction boundary.
