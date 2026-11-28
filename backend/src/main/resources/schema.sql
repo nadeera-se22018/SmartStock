@@ -373,6 +373,8 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     reference_type VARCHAR(50),
     reference_id BIGINT,
     reason VARCHAR(255),
+    idempotency_key VARCHAR(128) NULL,
+    request_hash CHAR(64) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_stock_movements_product
         FOREIGN KEY (product_id) REFERENCES products (id),
@@ -381,9 +383,72 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     CONSTRAINT chk_stock_movements_values CHECK (
         quantity > 0 AND quantity_before >= 0 AND quantity_after >= 0
     ),
+    CONSTRAINT chk_stock_movements_equation CHECK (
+        (movement_type IN ('PURCHASE_RECEIPT', 'SALE_RETURN', 'ADJUSTMENT_IN')
+            AND quantity_after = quantity_before + quantity)
+        OR (movement_type IN ('SALE', 'ADJUSTMENT_OUT')
+            AND quantity_after = quantity_before - quantity)
+    ),
+    CONSTRAINT chk_stock_movements_adjustment_reason CHECK (
+        movement_type NOT IN ('ADJUSTMENT_IN', 'ADJUSTMENT_OUT')
+        OR (reason IS NOT NULL AND CHAR_LENGTH(TRIM(reason)) > 0)
+    ),
+    CONSTRAINT chk_stock_movements_idempotency CHECK (
+        (idempotency_key IS NULL AND request_hash IS NULL)
+        OR (movement_type IN ('ADJUSTMENT_IN', 'ADJUSTMENT_OUT')
+            AND idempotency_key IS NOT NULL AND request_hash IS NOT NULL)
+    ),
     INDEX idx_stock_movements_product_date (product_id, created_at),
-    INDEX idx_stock_movements_reference (reference_type, reference_id)
+    INDEX idx_stock_movements_reference (reference_type, reference_id),
+    INDEX idx_stock_movements_type_date (movement_type, created_at),
+    UNIQUE INDEX uk_stock_movements_idempotency_key (idempotency_key)
 ) ENGINE=InnoDB;
+
+ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(128) NULL;
+ALTER TABLE stock_movements ADD COLUMN IF NOT EXISTS request_hash CHAR(64) NULL;
+ALTER TABLE stock_movements ADD UNIQUE INDEX IF NOT EXISTS uk_stock_movements_idempotency_key (idempotency_key);
+
+SET @stock_movement_equation_ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE()
+            AND table_name = 'stock_movements'
+            AND constraint_name = 'chk_stock_movements_equation'
+    ),
+    'SELECT 1',
+    'ALTER TABLE stock_movements ADD CONSTRAINT chk_stock_movements_equation CHECK ((movement_type IN (''PURCHASE_RECEIPT'', ''SALE_RETURN'', ''ADJUSTMENT_IN'') AND quantity_after = quantity_before + quantity) OR (movement_type IN (''SALE'', ''ADJUSTMENT_OUT'') AND quantity_after = quantity_before - quantity))'
+);
+PREPARE stock_movement_equation_stmt FROM @stock_movement_equation_ddl;
+EXECUTE stock_movement_equation_stmt;
+DEALLOCATE PREPARE stock_movement_equation_stmt;
+
+SET @stock_movement_reason_ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE()
+            AND table_name = 'stock_movements'
+            AND constraint_name = 'chk_stock_movements_adjustment_reason'
+    ),
+    'SELECT 1',
+    'ALTER TABLE stock_movements ADD CONSTRAINT chk_stock_movements_adjustment_reason CHECK (movement_type NOT IN (''ADJUSTMENT_IN'', ''ADJUSTMENT_OUT'') OR (reason IS NOT NULL AND CHAR_LENGTH(TRIM(reason)) > 0))'
+);
+PREPARE stock_movement_reason_stmt FROM @stock_movement_reason_ddl;
+EXECUTE stock_movement_reason_stmt;
+DEALLOCATE PREPARE stock_movement_reason_stmt;
+
+SET @stock_movement_idempotency_ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE()
+            AND table_name = 'stock_movements'
+            AND constraint_name = 'chk_stock_movements_idempotency'
+    ),
+    'SELECT 1',
+    'ALTER TABLE stock_movements ADD CONSTRAINT chk_stock_movements_idempotency CHECK ((idempotency_key IS NULL AND request_hash IS NULL) OR (movement_type IN (''ADJUSTMENT_IN'', ''ADJUSTMENT_OUT'') AND idempotency_key IS NOT NULL AND request_hash IS NOT NULL))'
+);
+PREPARE stock_movement_idempotency_stmt FROM @stock_movement_idempotency_ddl;
+EXECUTE stock_movement_idempotency_stmt;
+DEALLOCATE PREPARE stock_movement_idempotency_stmt;
 
 CREATE TABLE IF NOT EXISTS audit_logs (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,

@@ -52,6 +52,12 @@ public class StockMovement {
     @Column(length = 255)
     private String reason;
 
+    @Column(name = "idempotency_key", length = 128, unique = true)
+    private String idempotencyKey;
+
+    @Column(name = "request_hash", columnDefinition = "CHAR(64)", length = 64)
+    private String requestHash;
+
     @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
     private Instant createdAt;
 
@@ -61,21 +67,27 @@ public class StockMovement {
     public StockMovement(
         Product product,
         Long performedBy,
+        StockMovementType movementType,
         BigDecimal quantity,
         BigDecimal quantityBefore,
         BigDecimal quantityAfter,
-        Long receiptId,
-        Long purchaseOrderId
+        String referenceType,
+        Long referenceId,
+        String reason,
+        String idempotencyKey,
+        String requestHash
     ) {
         this.product = product;
         this.performedBy = performedBy;
-        this.movementType = StockMovementType.PURCHASE_RECEIPT;
+        this.movementType = movementType;
         this.quantity = quantity;
         this.quantityBefore = quantityBefore;
         this.quantityAfter = quantityAfter;
-        this.referenceType = "GOODS_RECEIPT";
-        this.referenceId = receiptId;
-        this.reason = "Goods receipt for purchase order " + purchaseOrderId;
+        this.referenceType = referenceType;
+        this.referenceId = referenceId;
+        this.reason = reason;
+        this.idempotencyKey = idempotencyKey;
+        this.requestHash = requestHash;
     }
 
     public Long getId() { return id; }
@@ -88,5 +100,7 @@ public class StockMovement {
     public String getReferenceType() { return referenceType; }
     public Long getReferenceId() { return referenceId; }
     public String getReason() { return reason; }
+    public String getIdempotencyKey() { return idempotencyKey; }
+    public String getRequestHash() { return requestHash; }
     public Instant getCreatedAt() { return createdAt; }
 }

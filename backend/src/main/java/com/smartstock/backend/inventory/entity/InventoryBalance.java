@@ -51,6 +51,11 @@ public class InventoryBalance {
         return quantityOnHand;
     }
 
+    public BigDecimal decreaseOnHand(BigDecimal quantity) {
+        quantityOnHand = quantityOnHand.subtract(quantity);
+        return quantityOnHand;
+    }
+
     public Long getId() { return id; }
     public Product getProduct() { return product; }
     public BigDecimal getQuantityOnHand() { return quantityOnHand; }
